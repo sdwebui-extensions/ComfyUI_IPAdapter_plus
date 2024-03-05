@@ -15,17 +15,24 @@ import torch.nn.functional as F
 import torchvision.transforms as TT
 
 from .resampler import PerceiverAttention, FeedForward, Resampler
+from comfy.cli_args import args
 
 # set the models directory backward compatible
 GLOBAL_MODELS_DIR = os.path.join(folder_paths.models_dir, "ipadapter")
+if args.just_ui:
+    GLOBAL_MODELS_DIR = os.path.join(os.path.dirname(args.data_dir), "models/ipadapter")
+if not os.path.exists(GLOBAL_MODELS_DIR):
+    os.makedirs(GLOBAL_MODELS_DIR, exist_ok=True)
 MODELS_DIR = GLOBAL_MODELS_DIR if os.path.isdir(GLOBAL_MODELS_DIR) else os.path.join(os.path.dirname(os.path.realpath(__file__)), "models")
 if "ipadapter" not in folder_paths.folder_names_and_paths:
-    current_paths = [MODELS_DIR]
+    current_paths = [MODELS_DIR, os.path.join(MODELS_DIR.replace('ipadapter', 'controlnet')), os.path.join(MODELS_DIR.replace('ipadapter', 'ControlNet'))]
 else:
     current_paths, _ = folder_paths.folder_names_and_paths["ipadapter"]
 folder_paths.folder_names_and_paths["ipadapter"] = (current_paths, folder_paths.supported_pt_extensions)
 
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
+if args.just_ui:
+    INSIGHTFACE_DIR = os.path.join(os.path.dirname(args.data_dir), "models/insightface")
 
 class FacePerceiverResampler(torch.nn.Module):
     def __init__(
@@ -582,6 +589,9 @@ class IPAdapterModelLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "ipadapter_file": (folder_paths.get_filename_list("ipadapter"), )}}
+    @classmethod
+    def refresh(s):
+        folder_paths.get_filename_list("ipadapter", refresh=True)
 
     RETURN_TYPES = ("IPADAPTER",)
     FUNCTION = "load_ipadapter_model"
