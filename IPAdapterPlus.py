@@ -35,6 +35,8 @@ if "ipadapter" not in folder_paths.folder_names_and_paths:
     current_paths = [os.path.join(folder_paths.models_dir, "ipadapter"), os.path.join(folder_paths.models_dir, 'controlnet'), os.path.join(folder_paths.models_dir, 'ControlNet')]
 else:
     current_paths, _ = folder_paths.folder_names_and_paths["ipadapter"]
+if os.path.exists('/stable-diffusion-cache/models/ControlNet'):
+    current_paths.append('/stable-diffusion-cache/models/ControlNet')
 folder_paths.folder_names_and_paths["ipadapter"] = (current_paths, folder_paths.supported_pt_extensions)
 
 WEIGHT_TYPES = ["linear", "ease in", "ease out", 'ease in-out', 'reverse in-out', 'weak input', 'weak output', 'weak middle', 'strong middle', 'style transfer (SDXL)']
