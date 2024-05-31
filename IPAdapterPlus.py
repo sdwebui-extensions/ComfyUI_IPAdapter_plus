@@ -17,7 +17,7 @@ except ImportError:
     import torchvision.transforms as T
 
 from .image_proj_models import MLPProjModel, MLPProjModelFaceId, ProjModelFaceIdPlus, Resampler, ImageProjModel
-from .CrossAttentionPatch import CrossAttentionPatch
+from .CrossAttentionPatch import Attn2Replace, ipadapter_attention
 from .utils import (
     encode_image_masked,
     tensor_to_size,
@@ -117,14 +117,60 @@ class IPAdapter(nn.Module):
         return image_proj_model
 
     @torch.inference_mode()
-    def get_image_embeds(self, clip_embed, clip_embed_zeroed):
-        image_prompt_embeds = self.image_proj_model(clip_embed)
-        uncond_image_prompt_embeds = self.image_proj_model(clip_embed_zeroed)
+    def get_image_embeds(self, clip_embed, clip_embed_zeroed, batch_size):
+        torch_device = model_management.get_torch_device()
+        intermediate_device = model_management.intermediate_device()
+
+        if batch_size == 0:
+            batch_size = clip_embed.shape[0]
+            intermediate_device = torch_device
+        elif batch_size > clip_embed.shape[0]:
+            batch_size = clip_embed.shape[0]
+
+        clip_embed = torch.split(clip_embed, batch_size, dim=0)
+        clip_embed_zeroed = torch.split(clip_embed_zeroed, batch_size, dim=0)
+
+        image_prompt_embeds = []
+        uncond_image_prompt_embeds = []
+
+        for ce, cez in zip(clip_embed, clip_embed_zeroed):
+            image_prompt_embeds.append(self.image_proj_model(ce.to(torch_device)).to(intermediate_device))
+            uncond_image_prompt_embeds.append(self.image_proj_model(cez.to(torch_device)).to(intermediate_device))
+        
+        del clip_embed, clip_embed_zeroed
+
+        image_prompt_embeds = torch.cat(image_prompt_embeds, dim=0)
+        uncond_image_prompt_embeds = torch.cat(uncond_image_prompt_embeds, dim=0)
+        
+        torch.cuda.empty_cache()
+
+        #image_prompt_embeds = self.image_proj_model(clip_embed)
+        #uncond_image_prompt_embeds = self.image_proj_model(clip_embed_zeroed)
         return image_prompt_embeds, uncond_image_prompt_embeds
 
     @torch.inference_mode()
-    def get_image_embeds_faceid_plus(self, face_embed, clip_embed, s_scale, shortcut):
-        embeds = self.image_proj_model(face_embed, clip_embed, scale=s_scale, shortcut=shortcut)
+    def get_image_embeds_faceid_plus(self, face_embed, clip_embed, s_scale, shortcut, batch_size):
+        torch_device = model_management.get_torch_device()
+        intermediate_device = model_management.intermediate_device()
+
+        if batch_size == 0:
+            batch_size = clip_embed.shape[0]
+            intermediate_device = torch_device
+        elif batch_size > clip_embed.shape[0]:
+            batch_size = clip_embed.shape[0]
+        
+        face_embed_batch = torch.split(face_embed, batch_size, dim=0)
+        clip_embed_batch = torch.split(clip_embed, batch_size, dim=0)
+
+        embeds = []
+        for face_embed, clip_embed in zip(face_embed_batch, clip_embed_batch):
+            embeds.append(self.image_proj_model(face_embed.to(torch_device), clip_embed.to(torch_device), scale=s_scale, shortcut=shortcut).to(intermediate_device))
+
+        del face_embed_batch, clip_embed_batch
+
+        embeds = torch.cat(embeds, dim=0)
+        torch.cuda.empty_cache()
+        #embeds = self.image_proj_model(face_embed, clip_embed, scale=s_scale, shortcut=shortcut)
         return embeds
 
 class To_KV(nn.Module):
@@ -137,15 +183,22 @@ class To_KV(nn.Module):
             self.to_kvs[key.replace(".weight", "").replace(".", "_")].weight.data = value
 
 def set_model_patch_replace(model, patch_kwargs, key):
-    to = model.model_options["transformer_options"]
+    to = model.model_options["transformer_options"].copy()
     if "patches_replace" not in to:
         to["patches_replace"] = {}
+    else:
+        to["patches_replace"] = to["patches_replace"].copy()
+
     if "attn2" not in to["patches_replace"]:
         to["patches_replace"]["attn2"] = {}
-    if key not in to["patches_replace"]["attn2"]:
-        to["patches_replace"]["attn2"][key] = CrossAttentionPatch(**patch_kwargs)
     else:
-        to["patches_replace"]["attn2"][key].set_new_condition(**patch_kwargs)
+        to["patches_replace"]["attn2"] = to["patches_replace"]["attn2"].copy()
+    
+    if key not in to["patches_replace"]["attn2"]:
+        to["patches_replace"]["attn2"][key] = Attn2Replace(ipadapter_attention, **patch_kwargs)
+        model.model_options["transformer_options"] = to
+    else:
+        to["patches_replace"]["attn2"][key].add(ipadapter_attention, **patch_kwargs)
 
 def ipadapter_execute(model,
                       ipadapter,
@@ -171,7 +224,7 @@ def ipadapter_execute(model,
     device = model_management.get_torch_device()
     dtype = model_management.unet_dtype()
     if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
-        dtype = torch.float16 if comfy.model_management.should_use_fp16() else torch.float32
+        dtype = torch.float16 if model_management.should_use_fp16() else torch.float32
 
     is_full = "proj.3.weight" in ipadapter["image_proj"]
     is_portrait = "proj.2.weight" in ipadapter["image_proj"] and not "proj.3.weight" in ipadapter["image_proj"] and not "0.to_q_lora.down.weight" in ipadapter["ip_adapter"]
@@ -346,16 +399,17 @@ def ipadapter_execute(model,
     ).to(device, dtype=dtype)
 
     if is_faceid and is_plus:
-        cond = ipa.get_image_embeds_faceid_plus(face_cond_embeds, img_cond_embeds, weight_faceidv2, is_faceidv2)
+        cond = ipa.get_image_embeds_faceid_plus(face_cond_embeds, img_cond_embeds, weight_faceidv2, is_faceidv2, encode_batch_size)
         # TODO: check if noise helps with the uncond face embeds
-        uncond = ipa.get_image_embeds_faceid_plus(torch.zeros_like(face_cond_embeds), img_uncond_embeds, weight_faceidv2, is_faceidv2)
+        uncond = ipa.get_image_embeds_faceid_plus(torch.zeros_like(face_cond_embeds), img_uncond_embeds, weight_faceidv2, is_faceidv2, encode_batch_size)
     else:
-        cond, uncond = ipa.get_image_embeds(img_cond_embeds, img_uncond_embeds)
+        cond, uncond = ipa.get_image_embeds(img_cond_embeds, img_uncond_embeds, encode_batch_size)
         if img_comp_cond_embeds is not None:
-            cond_comp = ipa.get_image_embeds(img_comp_cond_embeds, img_uncond_embeds)[0]
+            cond_comp = ipa.get_image_embeds(img_comp_cond_embeds, img_uncond_embeds, encode_batch_size)[0]
 
     cond = cond.to(device, dtype=dtype)
     uncond = uncond.to(device, dtype=dtype)
+
     cond_alt = None
     if img_comp_cond_embeds is not None:
         cond_alt = { 3: cond_comp.to(device, dtype=dtype) }
@@ -367,7 +421,6 @@ def ipadapter_execute(model,
 
     patch_kwargs = {
         "ipadapter": ipa,
-        "number": 0,
         "weight": weight,
         "cond": cond,
         "cond_alt": cond_alt,
@@ -380,28 +433,35 @@ def ipadapter_execute(model,
         "embeds_scaling": embeds_scaling,
     }
 
+    number = 0
     if not is_sdxl:
         for id in [1,2,4,5,7,8]: # id of input_blocks that have cross attention
+            patch_kwargs["module_key"] = str(number*2+1)
             set_model_patch_replace(model, patch_kwargs, ("input", id))
-            patch_kwargs["number"] += 1
+            number += 1
         for id in [3,4,5,6,7,8,9,10,11]: # id of output_blocks that have cross attention
+            patch_kwargs["module_key"] = str(number*2+1)
             set_model_patch_replace(model, patch_kwargs, ("output", id))
-            patch_kwargs["number"] += 1
+            number += 1
+        patch_kwargs["module_key"] = str(number*2+1)
         set_model_patch_replace(model, patch_kwargs, ("middle", 0))
     else:
         for id in [4,5,7,8]: # id of input_blocks that have cross attention
             block_indices = range(2) if id in [4, 5] else range(10) # transformer_depth
             for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
                 set_model_patch_replace(model, patch_kwargs, ("input", id, index))
-                patch_kwargs["number"] += 1
+                number += 1
         for id in range(6): # id of output_blocks that have cross attention
             block_indices = range(2) if id in [3, 4, 5] else range(10) # transformer_depth
             for index in block_indices:
+                patch_kwargs["module_key"] = str(number*2+1)
                 set_model_patch_replace(model, patch_kwargs, ("output", id, index))
-                patch_kwargs["number"] += 1
+                number += 1
         for index in range(10):
+            patch_kwargs["module_key"] = str(number*2+1)
             set_model_patch_replace(model, patch_kwargs, ("middle", 0, index))
-            patch_kwargs["number"] += 1
+            number += 1
 
     return (model, image)
 
@@ -845,7 +905,7 @@ class IPAdapterTiled:
     FUNCTION = "apply_tiled"
     CATEGORY = "ipadapter/tiled"
 
-    def apply_tiled(self, model, ipadapter, image, weight, weight_type, start_at, end_at, sharpening, combine_embeds="concat", image_negative=None, attn_mask=None, clip_vision=None, embeds_scaling='V only'):
+    def apply_tiled(self, model, ipadapter, image, weight, weight_type, start_at, end_at, sharpening, combine_embeds="concat", image_negative=None, attn_mask=None, clip_vision=None, embeds_scaling='V only', encode_batch_size=0):
         # 1. Select the models
         if 'ipadapter' in ipadapter:
             ipadapter_model = ipadapter['ipadapter']['model']
@@ -943,6 +1003,7 @@ class IPAdapterTiled:
                 "attn_mask": masks[i],
                 "unfold_batch": self.unfold_batch,
                 "embeds_scaling": embeds_scaling,
+                "encode_batch_size": encode_batch_size,
             }
             # apply the ipadapter to the model without cloning it
             model, _ = ipadapter_execute(model, ipadapter_model, clip_vision, **ipa_args)
@@ -966,6 +1027,7 @@ class IPAdapterTiledBatch(IPAdapterTiled):
                 "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
                 "sharpening": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05 }),
                 "embeds_scaling": (['V only', 'K+V', 'K+V w/ C penalty', 'K+mean(V) w/ C penalty'], ),
+                "encode_batch_size": ("INT", { "default": 0, "min": 0, "max": 4096 }),
             },
             "optional": {
                 "image_negative": ("IMAGE",),
@@ -1474,7 +1536,9 @@ class IPAdapterWeights:
 
         weights_invert = [1.0 - w for w in weights]
 
-        return (weights, weights_invert, len(weights), image_1, image_2, weights_strategy,)
+        frame_count = len(weights)
+
+        return (weights, weights_invert, frame_count, image_1, image_2, weights_strategy,)
 
 class IPAdapterWeightsFromStrategy(IPAdapterWeights):
     @classmethod
