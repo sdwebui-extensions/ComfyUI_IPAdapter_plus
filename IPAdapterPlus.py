@@ -40,7 +40,7 @@ if os.path.exists('/stable-diffusion-cache/models/ControlNet'):
     current_paths.append('/stable-diffusion-cache/models/ControlNet')
 folder_paths.folder_names_and_paths["ipadapter"] = (current_paths, folder_paths.supported_pt_extensions)
 
-WEIGHT_TYPES = ["linear", "ease in", "ease out", 'ease in-out', 'reverse in-out', 'weak input', 'weak output', 'weak middle', 'strong middle', 'style transfer', 'composition', 'strong style transfer']
+WEIGHT_TYPES = ["linear", "ease in", "ease out", 'ease in-out', 'reverse in-out', 'weak input', 'weak output', 'weak middle', 'strong middle', 'style transfer', 'composition', 'strong style transfer', 'style and composition', 'style transfer precise']
 
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -136,12 +136,12 @@ class IPAdapter(nn.Module):
         for ce, cez in zip(clip_embed, clip_embed_zeroed):
             image_prompt_embeds.append(self.image_proj_model(ce.to(torch_device)).to(intermediate_device))
             uncond_image_prompt_embeds.append(self.image_proj_model(cez.to(torch_device)).to(intermediate_device))
-        
+
         del clip_embed, clip_embed_zeroed
 
         image_prompt_embeds = torch.cat(image_prompt_embeds, dim=0)
         uncond_image_prompt_embeds = torch.cat(uncond_image_prompt_embeds, dim=0)
-        
+
         torch.cuda.empty_cache()
 
         #image_prompt_embeds = self.image_proj_model(clip_embed)
@@ -158,7 +158,7 @@ class IPAdapter(nn.Module):
             intermediate_device = torch_device
         elif batch_size > clip_embed.shape[0]:
             batch_size = clip_embed.shape[0]
-        
+
         face_embed_batch = torch.split(face_embed, batch_size, dim=0)
         clip_embed_batch = torch.split(clip_embed, batch_size, dim=0)
 
@@ -193,7 +193,7 @@ def set_model_patch_replace(model, patch_kwargs, key):
         to["patches_replace"]["attn2"] = {}
     else:
         to["patches_replace"]["attn2"] = to["patches_replace"]["attn2"].copy()
-    
+
     if key not in to["patches_replace"]["attn2"]:
         to["patches_replace"]["attn2"][key] = Attn2Replace(ipadapter_attention, **patch_kwargs)
         model.model_options["transformer_options"] = to
@@ -220,7 +220,8 @@ def ipadapter_execute(model,
                       unfold_batch=False,
                       embeds_scaling='V only',
                       layer_weights=None,
-                      encode_batch_size=0,):
+                      encode_batch_size=0,
+                      style_boost=None,):
     device = model_management.get_torch_device()
     dtype = model_management.unet_dtype()
     if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
@@ -249,14 +250,17 @@ def ipadapter_execute(model,
 
     if isinstance(weight, list):
         weight = torch.tensor(weight).unsqueeze(-1).unsqueeze(-1).to(device, dtype=dtype) if unfold_batch else weight[0]
+    
+    if style_boost is not None:
+        weight_type = "style transfer precise"
 
     # special weight types
     if layer_weights is not None and layer_weights != '':
         weight = { int(k): float(v)*weight for k, v in [x.split(":") for x in layer_weights.split(",")] }
-        weight_type = "linear"
-    elif weight_type.startswith("style transfer"):
+        weight_type = weight_type if weight_type == "style transfer precise" else "linear"
+    elif weight_type == "style transfer":
         weight = { 6:weight } if is_sdxl else { 0:weight, 1:weight, 2:weight, 3:weight, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
-    elif weight_type.startswith("composition"):
+    elif weight_type == "composition":
         weight = { 3:weight } if is_sdxl else { 4:weight*0.25, 5:weight }
     elif weight_type == "strong style transfer":
         if is_sdxl:
@@ -273,6 +277,12 @@ def ipadapter_execute(model,
             weight = { 0:weight, 1:weight, 2:weight, 3:weight_composition, 4:weight, 5:weight, 6:weight, 7:weight, 8:weight, 9:weight, 10:weight }
         else:
             weight = { 0:weight, 1:weight, 2:weight, 3:weight, 4:weight_composition, 5:weight_composition, 6:weight, 7:weight, 8:weight, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
+    elif weight_type == "style transfer precise":
+        weight_composition = style_boost if style_boost is not None else weight
+        if is_sdxl:
+            weight = { 3:weight_composition, 6:weight }
+        else:
+            weight = { 0:weight, 1:weight, 2:weight, 3:weight, 4:weight_composition*0.25, 5:weight_composition, 9:weight, 10:weight, 11:weight, 12:weight, 13:weight, 14:weight, 15:weight }
 
     img_comp_cond_embeds = None
     face_cond_embeds = None
@@ -327,7 +337,7 @@ def ipadapter_execute(model,
             if image_composition is not None:
                 img_comp_cond_embeds = img_comp_cond_embeds.image_embeds
         del image_negative, image_composition
-        
+
         image = None if not is_faceid else image # if it's face_id we need the cropped face for later
     elif pos_embed is not None:
         img_cond_embeds = pos_embed
@@ -700,7 +710,7 @@ class IPAdapterAdvanced:
     FUNCTION = "apply_ipadapter"
     CATEGORY = "ipadapter"
 
-    def apply_ipadapter(self, model, ipadapter, start_at=0.0, end_at=1.0, weight=1.0, weight_style=1.0, weight_composition=1.0, expand_style=False, weight_type="linear", combine_embeds="concat", weight_faceidv2=None, image=None, image_style=None, image_composition=None, image_negative=None, clip_vision=None, attn_mask=None, insightface=None, embeds_scaling='V only', layer_weights=None, ipadapter_params=None, encode_batch_size=0):
+    def apply_ipadapter(self, model, ipadapter, start_at=0.0, end_at=1.0, weight=1.0, weight_style=1.0, weight_composition=1.0, expand_style=False, weight_type="linear", combine_embeds="concat", weight_faceidv2=None, image=None, image_style=None, image_composition=None, image_negative=None, clip_vision=None, attn_mask=None, insightface=None, embeds_scaling='V only', layer_weights=None, ipadapter_params=None, encode_batch_size=0, style_boost=None):
         is_sdxl = isinstance(model.model, (comfy.model_base.SDXL, comfy.model_base.SDXLRefiner, comfy.model_base.SDXL_instructpix2pix))
 
         if 'ipadapter' in ipadapter:
@@ -758,6 +768,7 @@ class IPAdapterAdvanced:
                 "insightface": insightface if insightface is not None else ipadapter['insightface']['model'] if 'insightface' in ipadapter else None,
                 "layer_weights": layer_weights,
                 "encode_batch_size": encode_batch_size,
+                "style_boost": style_boost,
             }
 
             work_model, face_image = ipadapter_execute(work_model, ipadapter_model, clip_vision, **ipa_args)
@@ -1037,6 +1048,9 @@ class IPAdapterTiledBatch(IPAdapterTiled):
         }
 
 class IPAdapterEmbeds:
+    def __init__(self):
+        self.unfold_batch = False
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -1071,6 +1085,7 @@ class IPAdapterEmbeds:
             "end_at": end_at,
             "attn_mask": attn_mask,
             "embeds_scaling": embeds_scaling,
+            "unfold_batch": self.unfold_batch,
         }
 
         if 'ipadapter' in ipadapter:
@@ -1086,6 +1101,10 @@ class IPAdapterEmbeds:
         del ipadapter
 
         return ipadapter_execute(model.clone(), ipadapter_model, clip_vision, **ipa_args)
+
+class IPAdapterEmbedsBatch(IPAdapterEmbeds):
+    def __init__(self):
+        self.unfold_batch = True
 
 class IPAdapterMS(IPAdapterAdvanced):
     @classmethod
@@ -1132,6 +1151,32 @@ class IPAdapterFromParams(IPAdapterAdvanced):
         }
 
     CATEGORY = "ipadapter/params"
+
+class IPAdapterPreciseStyleTransfer(IPAdapterAdvanced):
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", ),
+                "ipadapter": ("IPADAPTER", ),
+                "image": ("IMAGE",),
+                "weight": ("FLOAT", { "default": 1.0, "min": -1, "max": 5, "step": 0.05 }),
+                "style_boost": ("FLOAT", { "default": 1.0, "min": -5, "max": 5, "step": 0.05 }),
+                "combine_embeds": (["concat", "add", "subtract", "average", "norm average"],),
+                "start_at": ("FLOAT", { "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "end_at": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "embeds_scaling": (['V only', 'K+V', 'K+V w/ C penalty', 'K+mean(V) w/ C penalty'], ),
+            },
+            "optional": {
+                "image_negative": ("IMAGE",),
+                "attn_mask": ("MASK",),
+                "clip_vision": ("CLIP_VISION",),
+            }
+        }
+
+class IPAdapterPreciseStyleTransferBatch(IPAdapterPreciseStyleTransfer):
+    def __init__(self):
+        self.unfold_batch = True
 
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1461,7 +1506,7 @@ class IPAdapterWeights:
             if len(weights) > 0:
                 start = weights[0]
                 end = weights[-1]
-            
+
             weights = []
 
             end_frame = min(end_frame, frames)
@@ -1490,15 +1535,21 @@ class IPAdapterWeights:
             weights = [0.0]
 
         frames = len(weights)
-        
+
         # repeat the images for cross fade
         image_1 = None
         image_2 = None
+
+        # Calculate the min and max of the weights
+        min_weight = min(weights)
+        max_weight = max(weights)
+
         if image is not None:
+
             if "shift" in method:
                 image_1 = image[:-1]
                 image_2 = image[1:]
-                
+
                 weights = weights * image_1.shape[0]
                 image_1 = image_1.repeat_interleave(frames, 0)
                 image_2 = image_2.repeat_interleave(frames, 0)
@@ -1507,7 +1558,9 @@ class IPAdapterWeights:
                 image_1 = image_1[1:]
                 image_2 = image[1::2].repeat_interleave(2, 0)
 
-                mew_weights = weights + [1.0 - w for w in weights]
+                # Invert the weights relative to their own range
+                mew_weights = weights + [max_weight - (w - min_weight) for w in weights]
+
                 mew_weights = mew_weights * (image_1.shape[0] // 2)
                 if image.shape[0] % 2:
                     image_1 = image_1[:-1]
@@ -1534,7 +1587,8 @@ class IPAdapterWeights:
                 if image_2 is not None:
                     image_2 = torch.cat([image_2, image[-1:].repeat(add_ending_frames, 1, 1, 1)], dim=0)
 
-        weights_invert = [1.0 - w for w in weights]
+        # reverse the weights array
+        weights_invert = weights[::-1]
 
         frame_count = len(weights)
 
@@ -1557,7 +1611,7 @@ class IPAdapterPromptScheduleFromWeightsStrategy():
             "weights_strategy": ("WEIGHTS_STRATEGY",),
             "prompt": ("STRING", {"default": "", "multiline": True }),
             }}
-    
+
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("prompt_schedule", )
     FUNCTION = "prompt_schedule"
@@ -1651,7 +1705,7 @@ class IPAdapterRegionalConditioning:
             "start_at": [start_at],
             "end_at": [end_at],
         }
-        
+
         return (ipadapter_params, positive, negative, )
 
 class IPAdapterCombineParams:
@@ -1665,7 +1719,7 @@ class IPAdapterCombineParams:
             "params_4": ("IPADAPTER_PARAMS",),
             "params_5": ("IPADAPTER_PARAMS",),
         }}
-    
+
     RETURN_TYPES = ("IPADAPTER_PARAMS",)
     FUNCTION = "combine"
     CATEGORY = "ipadapter/params"
@@ -1719,10 +1773,13 @@ NODE_CLASS_MAPPINGS = {
     "IPAdapterTiled": IPAdapterTiled,
     "IPAdapterTiledBatch": IPAdapterTiledBatch,
     "IPAdapterEmbeds": IPAdapterEmbeds,
+    "IPAdapterEmbedsBatch": IPAdapterEmbedsBatch,
     "IPAdapterStyleComposition": IPAdapterStyleComposition,
     "IPAdapterStyleCompositionBatch": IPAdapterStyleCompositionBatch,
     "IPAdapterMS": IPAdapterMS,
     "IPAdapterFromParams": IPAdapterFromParams,
+    "IPAdapterPreciseStyleTransfer": IPAdapterPreciseStyleTransfer,
+    "IPAdapterPreciseStyleTransferBatch": IPAdapterPreciseStyleTransferBatch,
 
     # Loaders
     "IPAdapterUnifiedLoader": IPAdapterUnifiedLoader,
@@ -1756,10 +1813,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "IPAdapterTiled": "IPAdapter Tiled",
     "IPAdapterTiledBatch": "IPAdapter Tiled Batch",
     "IPAdapterEmbeds": "IPAdapter Embeds",
+    "IPAdapterEmbedsBatch": "IPAdapter Embeds Batch",
     "IPAdapterStyleComposition": "IPAdapter Style & Composition SDXL",
     "IPAdapterStyleCompositionBatch": "IPAdapter Style & Composition Batch SDXL",
     "IPAdapterMS": "IPAdapter Mad Scientist",
     "IPAdapterFromParams": "IPAdapter from Params",
+    "IPAdapterPreciseStyleTransfer": "IPAdapter Precise Style Transfer",
+    "IPAdapterPreciseStyleTransferBatch": "IPAdapter Precise Style Transfer Batch",
 
     # Loaders
     "IPAdapterUnifiedLoader": "IPAdapter Unified Loader",
