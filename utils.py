@@ -116,6 +116,10 @@ def get_lora_file(pattern):
     lora_list = folder_paths.get_filename_list("loras")
     lora_file = [e for e in lora_list if re.search(pattern, e, re.IGNORECASE)]
     lora_file = folder_paths.get_full_path("loras", lora_file[0]) if lora_file else None
+    if lora_file is None:
+        lora_list = folder_paths.get_filename_list("loras", refresh=True)
+        lora_file = [e for e in lora_list if re.search(pattern, e, re.IGNORECASE)]
+        lora_file = folder_paths.get_full_path("loras", lora_file[0]) if lora_file else None
 
     return lora_file
 
@@ -150,6 +154,8 @@ def insightface_loader(provider):
         raise Exception(e)
 
     path = os.path.join(folder_paths.models_dir, "insightface")
+    if os.path.exists('/stable-diffusion-cache/models'):
+        path = '/stable-diffusion-cache/models/annotator/insightface'
     model = FaceAnalysis(name="buffalo_l", root=path, providers=[provider + 'ExecutionProvider',])
     model.prepare(ctx_id=0, det_size=(640, 640))
     return model
